@@ -1,17 +1,23 @@
 ---
-- name: Download local-path-provisioner
+# Applying the manifest of another release updates the Deployment, so
+# changing rke2_local_path_provisioner_version is enough to move
+# local-path-provisioner.
+#
+# The version is part of the file name on purpose: with a fixed name get_url
+# sends If-Modified-Since from its mtime, and a release tagged before that
+# download answers 304, leaving the old manifest to be applied again.
+- name: Download local-path-provisioner {{ rke2_local_path_provisioner_version }}
   ansible.builtin.get_url:
-    url: https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.29/deploy/local-path-storage.yaml
-    dest: /root/install
+    url: https://raw.githubusercontent.com/rancher/local-path-provisioner/{{ rke2_local_path_provisioner_version }}/deploy/local-path-storage.yaml
+    dest: /root/install/local-path-storage-{{ rke2_local_path_provisioner_version }}.yaml
     mode: '0644'
-    backup: true
   tags:
     - local-path-provisioner_download
 
 - name: Apply local-path-provisioner to k8s
   kubernetes.core.k8s:
     state: present
-    src: /root/install/local-path-storage.yaml
+    src: /root/install/local-path-storage-{{ rke2_local_path_provisioner_version }}.yaml
   tags:
     - local-path-provisioner_install
 

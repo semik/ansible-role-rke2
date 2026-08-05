@@ -4,4 +4,44 @@
 ansible_python_interpreter: /usr/bin/python3
 rke2_certmanager_helm_repository_name: jetstack
 rke2_certmanager_helm_repository_url: https://charts.jetstack.io
-rke2_certmanager_version: v1.15.3
+
+# local-path-provisioner provides the default storage class, set this to
+# false to leave the cluster without one.
+rke2_install_local_path_provisioner: true
+
+# Where the kubeconfig is copied to. custom_kube_cfg_dir is appended to this
+# list, so a consumer of the role adds directories instead of replacing it.
+rke2_base_kube_cfg_dir:
+  - owner: "root"
+    group: "root"
+    dir: "/root/.kube"
+
+# The versions the role picks when nothing is passed in, each exposed under
+# its own name so that whoever uses the role can build the rke2_* variable
+# below out of its own configuration and still fall back to the role default,
+# see the README.
+
+# Which cert-manager release Helm installs into the cluster.
+rke2_default_certmanager_version: v1.21.1
+# Which local-path-provisioner release provides the default storage class.
+rke2_default_local_path_provisioner_version: v0.0.36
+# Passed to the installer as INSTALL_RKE2_CHANNEL. Accepts 'stable',
+# 'latest', 'testing' or a minor release channel such as 'v1.32'. See
+# https://update.rke2.io/v1-release/channels
+rke2_default_channel: stable
+# Passed to the installer as INSTALL_RKE2_VERSION, e.g. v1.32.5+rke2r1.
+# Takes precedence over the channel. Empty means "resolve the channel".
+rke2_default_version: ""
+# By default the role installs RKE2 only once and never upgrades it. Set
+# this to true to let it upgrade an installed RKE2 in place, which stops and
+# starts the Kubernetes cluster. Only an exact rke2_version can be upgraded
+# to, a channel is resolved by the installer and there is nothing to compare
+# it with.
+rke2_default_allow_upgrade: false
+
+# What the tasks use. Override these, the values above are only the fallback.
+rke2_channel: "{{ rke2_default_channel }}"
+rke2_version: "{{ rke2_default_version }}"
+rke2_allow_upgrade: "{{ rke2_default_allow_upgrade }}"
+rke2_certmanager_version: "{{ rke2_default_certmanager_version }}"
+rke2_local_path_provisioner_version: "{{ rke2_default_local_path_provisioner_version }}"

@@ -46,6 +46,58 @@
     - rke2_kubectl_path
     - rke2_kubectl_path_bashrc
 
+- name: Look for an installed rke2 binary
+  ansible.builtin.stat:
+    path: /usr/local/bin/rke2
+  register: rke2_binary
+  tags:
+    - rke2_install
+
+# check_mode: false to get stdout during --check too; failed_when: false so a
+# broken binary doesn't abort the run.
+- name: Read the version of the installed rke2
+  ansible.builtin.command: /usr/local/bin/rke2 --version
+  register: rke2_version_cmd
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: rke2_binary.stat.exists
+  tags:
+    - rke2_install
+
+# 'rke2 version v1.35.5+rke2r1 (0e3a4d1b)' -> v1.35.5+rke2r1. regex_search
+# returns None when there is nothing to match, hence the default().
+- name: Note which RKE2 is installed
+  ansible.builtin.set_fact:
+    rke2_installed_version: >-
+      {{ rke2_version_cmd.stdout | default('')
+      | regex_search('v[0-9.]+[+]rke2r[0-9]+') | default('', true) }}
+  tags:
+    - rke2_install
+
+# An upgrade is only possible towards an exact version - a channel is resolved
+# by the installer, there is nothing to compare locally - and only when the
+# operator allowed it, because it stops and starts the cluster.
+- name: Decide what to do with RKE2
+  ansible.builtin.set_fact:
+    rke2_needs_install: "{{ not rke2_binary.stat.exists }}"
+    rke2_needs_upgrade: "{{ rke2_binary.stat.exists
+                            and rke2_version | length > 0
+                            and rke2_version != rke2_installed_version
+                            and rke2_allow_upgrade | bool }}"
+  tags:
+    - rke2_install
+
+- name: Report what is going to be done with RKE2
+  ansible.builtin.debug:
+    msg: >-
+      installed: {{ rke2_installed_version | default('none', true) }};
+      configured: {{ rke2_version | default('channel ' ~ rke2_channel, true) }};
+      action: {{ 'install' if rke2_needs_install | bool
+                 else ('upgrade' if rke2_needs_upgrade | bool else 'none') }}
+  tags:
+    - rke2_install
+
 # check_mode return changed in check mode, it was fixed in
 # Ansible 2.13.0, https://github.com/ansible/ansible/issues/65687
 - name: Download rke2 installer
@@ -57,13 +109,63 @@
   tags:
     - rke2_download
 
-# versions of rke2 are listed here:
-#    https://github.com/ansible/ansible/issues/65687
-# but we are OK with any present
+# An upgrade stops and starts the whole control plane, so make a restore
+# point first. This deliberately has no failed_when, a snapshot which
+# can't be taken aborts the play before RKE2 is touched. RKE2 adds a
+# timestamp to the name on its own.
+- name: Save an etcd snapshot before upgrading RKE2
+  ansible.builtin.command:
+    cmd: /usr/local/bin/rke2 etcd-snapshot save --name pre-upgrade
+  changed_when: true
+  when: rke2_needs_upgrade | bool
+  tags:
+    - rke2_install
+
+# The installer resolves INSTALL_RKE2_CHANNEL against
+# https://update.rke2.io/v1-release/channels , but only when
+# INSTALL_RKE2_VERSION is empty, so exactly one of the two is exported.
+#
+# There is no 'creates', the conditions above decide when the installer
+# runs. It only replaces the binary under /usr/local/bin and reloads
+# systemd, it doesn't restart the service, that is done below.
 - name: Exec rke2 installer
   ansible.builtin.command:
     cmd: /usr/local/bin/rke2-install.sh
-    creates: /usr/local/bin/rke2
+  environment: >-
+    {{ {'INSTALL_RKE2_VERSION': rke2_version} if rke2_version | length > 0
+       else {'INSTALL_RKE2_CHANNEL': rke2_channel} }}
+  changed_when: true
+  when: rke2_needs_install | bool or rke2_needs_upgrade | bool
+  tags:
+    - rke2_install
+
+# The new binary is only picked up by a restart, this is the documented
+# upgrade procedure, see https://docs.rke2.io/upgrades/manual
+- name: Restart rke2-server to activate the new RKE2
+  ansible.builtin.systemd:
+    name: rke2-server.service
+    state: restarted
+  when: rke2_needs_upgrade | bool
+  tags:
+    - rke2_install
+
+# Waiting for the node to report the new version proves both that the API
+# server came back and that the upgrade really took effect. kubeletVersion
+# has the same shape as rke2_version, e.g. v1.35.6+rke2r1. The kubeconfig
+# is given explicitly, /root/.kube/config is only created further down.
+- name: Wait until the node runs the new RKE2
+  ansible.builtin.command:
+    cmd: >-
+      /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml
+      get nodes -o jsonpath={.items[0].status.nodeInfo.kubeletVersion}
+  register: rke2_node_version
+  until: rke2_node_version.rc == 0 and rke2_node_version.stdout == rke2_version
+  retries: 60 # 5*60/5
+  delay: 5
+  changed_when: false
+  when:
+    - rke2_needs_upgrade | bool
+    - not ansible_check_mode
   tags:
     - rke2_install
 
@@ -87,7 +189,7 @@
 
 - name: Create var with paths
   ansible.builtin.set_fact:
-    kube_cfg_dir: "{{ rke2_default_kube_cfg_dir + custom_kube_cfg_dir | default([]) }}"
+    kube_cfg_dir: "{{ rke2_base_kube_cfg_dir + custom_kube_cfg_dir | default([]) }}"
   tags:
     - kube_config
 
@@ -133,10 +235,14 @@
     kube-system-wait
   when: not ansible_check_mode
 
-- name: Wait for installation of rke2-ingress-nginx-controller
+# Which ingress controller RKE2 deploys by default depends on its
+# version, traefik in the newer ones, ingress-nginx in the older ones.
+# pod_name is an extended regexp, so wait for whichever of the two shows
+# up instead of tying the role to one RKE2 release.
+- name: Wait for installation of the rke2 ingress controller
   ansible.builtin.include_tasks: wait2complete.yml
   vars:
-    pod_name: "rke2-ingress-nginx-controller"
+    pod_name: "rke2-traefik|rke2-ingress-nginx-controller"
     k8s_namespace: kube-system
   tags:
     kube-system-wait
